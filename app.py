@@ -1,54 +1,70 @@
 import streamlit as st
 import pandas as pd
+import time
 import joblib
+import requests
+from bs4 import BeautifulSoup
 
-# Load the saved model and TF-IDF vectorizer
-model = joblib.load('kmeans_model.pkl')
-vectorizer = joblib.load('vectorizer.pkl')
+@st.cache_resource
+def load_models():
+    kmeans_model = joblib.load('kmeans_model.pkl')
+    vectorizer = joblib.load('vectorizer.pkl')
+    return kmeans_model, vectorizer
 
-# Predict cluster for a single skills input
-def predict_job_cluster(skills_text, model, tfidf_vec):
-    features = tfidf_vec.transform([skills_text])
-    predicted_label = model.predict(features)
-    return predicted_label[0]
+def scrape_karkidi_jobs(keywords, pages=1):
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    base_url = "https://www.karkidi.com/Find-Jobs/{page}/all/India?search={query}"
+    jobs_list = []
 
-# Assign clusters to job DataFrame using loaded model
-def assign_clusters_to_jobs(job_dataframe, model, tfidf_vec):
-    skill_matrix = tfidf_vec.transform(job_dataframe['Skills'])
-    labels = model.predict(skill_matrix)
-    job_dataframe['Cluster'] = labels
-    return job_dataframe
+    for page in range(1, pages + 1):
+        for keyword in keywords:
+            url = base_url.format(page=page, query=keyword.replace(' ', '%20'))
+            response = requests.get(url, headers=headers)
+            soup = BeautifulSoup(response.content, "html.parser")
+            job_blocks = soup.find_all("div", class_="ads-details")
+            for job in job_blocks:
+                try:
+                    title = job.find("h4").get_text(strip=True)
+                    company = job.find("a", href=lambda x: x and "Employer-Profile" in x).get_text(strip=True)
+                    location = job.find("p").get_text(strip=True)
+                    experience = job.find("p", class_="emp-exp").get_text(strip=True)
+                    key_skills_tag = job.find("span", string="Key Skills")
+                    skills = key_skills_tag.find_next("p").get_text(strip=True) if key_skills_tag else ""
+                    summary_tag = job.find("span", string="Summary")
+                    summary = summary_tag.find_next("p").get_text(strip=True) if summary_tag else ""
 
-# Streamlit app layout
-st.title("Job Clustering App with Streamlit")
-st.write("Upload a CSV with a `Skills` column to cluster jobs using a pre-trained model.")
+                    jobs_list.append({
+                        "Title": title,
+                        "Company": company,
+                        "Location": location,
+                        "Experience": experience,
+                        "Summary": summary,
+                        "Skills": skills
+                    })
+                except Exception:
+                    continue
+            time.sleep(1)
+    return pd.DataFrame(jobs_list)
 
-# File uploader
-uploaded_file = st.file_uploader("Upload your jobs CSV file", type=['csv'])
+def cluster_jobs_with_loaded_model(df, kmeans_model, vectorizer):
+    X = vectorizer.transform(df['Skills'])
+    df['Cluster'] = kmeans_model.predict(X)
+    return df
 
-if uploaded_file is not None:
-    try:
-        df_jobs = pd.read_csv(uploaded_file)
-        if 'Skills' not in df_jobs.columns:
-            st.error("Uploaded CSV must contain a 'Skills' column.")
-        else:
-            clustered_df = assign_clusters_to_jobs(df_jobs, model, vectorizer)
-            st.success("Jobs clustered successfully!")
-            st.write(clustered_df)
+st.title("Karkidi Job Scraper with Pre-trained Clustering")
 
-            csv_download = clustered_df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Clustered CSV", data=csv_download, file_name="clustered_jobs.csv", mime="text/csv")
+keywords_input = st.text_input("Enter job keywords (comma-separated)", value="data science, software engineer, data analyst")
+pages = st.number_input("Number of pages to scrape per keyword", min_value=1, max_value=5, value=2)
 
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
-
-st.markdown("---")
-st.subheader("Predict Cluster for Custom Skills Input")
-input_skills = st.text_input("Enter skills (comma-separated):", placeholder="e.g. Python, AWS, Machine Learning")
-
-if st.button("Predict Cluster"):
-    if input_skills.strip() == "":
-        st.warning("Please enter some skills.")
+if st.button("Scrape & Cluster Jobs"):
+    keywords = [kw.strip() for kw in keywords_input.split(",") if kw.strip()]
+    with st.spinner("Loading models..."):
+        kmeans_model, vectorizer = load_models()
+    with st.spinner(f"Scraping {pages} pages for keywords: {', '.join(keywords)} ..."):
+        jobs_df = scrape_karkidi_jobs(keywords, pages)
+    if jobs_df.empty:
+        st.warning("No jobs found for these keywords.")
     else:
-        cluster = predict_job_cluster(input_skills, model, vectorizer)
-        st.success(f"The predicted cluster for the entered skills is: **Cluster {cluster}**")
+        clustered_df = cluster_jobs_with_loaded_model(jobs_df, kmeans_model, vectorizer)
+        st.success("Jobs clustered successfully!")
+        st.dataframe(clustered_df)
